@@ -57,7 +57,9 @@ with db_lock:
     """)
     conn.commit()
 
-link_pattern = r"https://t.me/\S+"
+# Регулярное выражение для ссылок Instagram и Telegram
+link_pattern = r"(?:https?://)?(?:www\.)?(?:instagram\.com|instagr\.am|t\.me)/(?:[^\s]+)"
+
 MSK = datetime.timezone(datetime.timedelta(hours=3))
 
 def msk_now():
@@ -103,31 +105,37 @@ def handle_message(message):
 
     chat_id = message.chat.id
     user_id = message.from_user.id
+    username = message.from_user.username or f"id{user_id}"
     is_user_admin = is_admin(chat_id, user_id)
+
+    print(f"[{msk_now().strftime('%H:%M:%S')}] Обработка сообщения от @{username}: {message.text[:100]}")
 
     # ---- Удаление сообщений в нерабочее время (выходные) ----
     if not is_work_time(message.date):
+        print(f"  → Время нерабочее (выходные). Удаляю сообщение.")
         if not is_user_admin:
             try:
                 bot.delete_message(chat_id, message.message_id)
-            except:
-                pass
+            except Exception as e:
+                print(f"  → Ошибка удаления: {e}")
         return
 
     # ---- Проверка наличия ссылок ----
     matches = re.findall(link_pattern, message.text)
     if not matches:
-        # Нет ссылки – удаляем сообщение (если не админ)
+        print(f"  → Ссылка не найдена. Удаляю сообщение.")
         if not is_user_admin:
             try:
                 bot.delete_message(chat_id, message.message_id)
-            except:
-                pass
+            except Exception as e:
+                print(f"  → Ошибка удаления: {e}")
         return
 
-    # Берём первую ссылку для задания
     link = matches[0]
+    if not link.startswith("http"):
+        link = "https://" + link
     activity = message.text.replace(link, "").strip() or "лайк"
+    print(f"  → Найдена ссылка: {link}")
 
     # ---- Лимит: 1 задание в сутки ----
     now = int(time.time())
@@ -136,32 +144,46 @@ def handle_message(message):
             "SELECT COUNT(*) FROM tasks WHERE author=? AND chat_id=? AND created>?",
             (user_id, chat_id, now - 86400)
         )
-        if cursor.fetchone()[0] >= 1:
-            bot.send_message(chat_id, "❗ Лимит 1 задание в сутки")
-            # Удаляем исходное сообщение, чтобы не засорять чат
-            if not is_user_admin:
-                try:
-                    bot.delete_message(chat_id, message.message_id)
-                except:
-                    pass
-            return
+        count = cursor.fetchone()[0]
+    if count >= 1:
+        print(f"  → Лимит превышен (уже {count} заданий за 24 часа). Отправляю предупреждение и удаляю сообщение.")
+        bot.send_message(
+            chat_id,
+            f"❗ @{username}, лимит 1 задание в сутки исчерпан. Задание не создано."
+        )
+        if not is_user_admin:
+            try:
+                bot.delete_message(chat_id, message.message_id)
+            except Exception as e:
+                print(f"  → Ошибка удаления: {e}")
+        return
 
     # ---- Создаём задание ----
-    with db_lock:
-        cursor.execute(
-            "INSERT INTO tasks (chat_id, author, author_name, link, activity, created) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (chat_id, user_id, message.from_user.username, link, activity, now)
-        )
-        task_id = cursor.lastrowid
-        conn.commit()
+    try:
+        with db_lock:
+            cursor.execute(
+                "INSERT INTO tasks (chat_id, author, author_name, link, activity, created) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (chat_id, user_id, username, link, activity, now)
+            )
+            task_id = cursor.lastrowid
+            conn.commit()
+        print(f"  → Задание создано (id={task_id})")
+    except Exception as e:
+        print(f"  → Критическая ошибка при создании задания: {e}")
+        return
 
     # Отправляем сообщение с заданием
-    sent = bot.send_message(
-        chat_id,
-        f"📢 Новое задание\n\n@{message.from_user.username}\n{link}\n{activity}",
-        reply_markup=keyboard(task_id)
-    )
+    try:
+        sent = bot.send_message(
+            chat_id,
+            f"📢 Новое задание\n\n@{username}\n{link}\n{activity}",
+            reply_markup=keyboard(task_id)
+        )
+        print(f"  → Сообщение с заданием отправлено, id={sent.message_id}")
+    except Exception as e:
+        print(f"  → Ошибка отправки сообщения с заданием: {e}")
+        return
 
     with db_lock:
         cursor.execute("UPDATE tasks SET message_id=? WHERE id=?", (sent.message_id, task_id))
@@ -171,8 +193,9 @@ def handle_message(message):
     if not is_user_admin:
         try:
             bot.delete_message(chat_id, message.message_id)
-        except:
-            pass
+            print(f"  → Исходное сообщение удалено.")
+        except Exception as e:
+            print(f"  → Ошибка удаления исходного сообщения: {e}")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("done_"))
 def done(call):
@@ -220,7 +243,6 @@ def done(call):
         )
         conn.commit()
 
-    # Тихо отвечаем на callback (без всплывающего уведомления)
     bot.answer_callback_query(call.id)
 
 # ---------- Планировщик ----------
@@ -247,7 +269,7 @@ def scheduler():
             fri_key = (chat_id, week_num)
             if day == 4 and hour == 23 and fri_key not in friday_notified:
                 try:
-                    bot.send_message(chat_id, "🌙 Пост-чат ушел на выходные! Актив по желанию")
+                    bot.send_message(chat_id, "🌙 Пост-чат ушел на выходные! Всем отличного отдыха 🥰")
                 except:
                     pass
                 friday_notified.add(fri_key)
@@ -256,7 +278,7 @@ def scheduler():
             mon_key = (chat_id, week_num)
             if day == 0 and hour == 7 and mon_key not in monday_notified:
                 try:
-                    bot.send_message(chat_id, "☀️ Доброе утро, пост-чат работает в нормальном режиме")
+                    bot.send_message(chat_id, "☀️ Доброе утро, пост-чат работает в нормальном режиме 🥳")
                 except:
                     pass
                 monday_notified.add(mon_key)
