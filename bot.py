@@ -25,6 +25,18 @@ def reset_webhook(token):
 reset_webhook(TOKEN)
 time.sleep(2)
 
+@bot.message_handler(commands=['start'])
+def send_welcome(message):
+    if message.chat.type == "private":
+        bot.send_message(
+            message.chat.id,
+            "👋 Привет! Я бот для взаимной активности.\n\n"
+            "📌 Правила:\n"
+            "• Отправляй ссылки на посты в чат – я создам задание.\n"
+            "• Выполнив задание, нажми кнопку под ним.\n"
+            "• Чтобы узнать свои невыполненные задания, напиши /my_tasks в личку.\n\n"
+            "Если есть вопросы – пиши администратору."
+        )
 bot = telebot.TeleBot(TOKEN)
 
 conn = sqlite3.connect("db.db", check_same_thread=False)
