@@ -87,13 +87,11 @@ def is_work_time(post_time):
         return False
 
 def is_admin(chat_id, user_id):
-    # Проверяем по списку ID из переменной окружения (если задан)
     admin_ids = os.environ.get("ADMIN_IDS", "")
     if admin_ids:
         admin_list = [int(x.strip()) for x in admin_ids.split(",") if x.strip().isdigit()]
         if user_id in admin_list:
             return True
-    # Иначе запрашиваем статус в группе
     try:
         status = bot.get_chat_member(chat_id, user_id).status
         return status in ["administrator", "creator"]
@@ -113,7 +111,7 @@ def keyboard(task_id):
     ))
     return markup
 
-# ---------- Команда /my_tasks (только в личке) ----------
+# ---------- Команда /my_tasks (исправленная фильтрация) ----------
 @bot.message_handler(commands=['my_tasks'])
 def my_tasks(message):
     if message.chat.type != "private":
@@ -127,26 +125,33 @@ def my_tasks(message):
             SELECT t.chat_id, t.id, t.link, t.activity, t.author_name, t.message_id
             FROM tasks t
             WHERE t.created > ?
+              AND t.author != ?
               AND NOT EXISTS (
                   SELECT 1 FROM completions c
                   WHERE c.task_id = t.id AND c.user_id = ?
               )
             ORDER BY t.created DESC
-        """, (now - 86400, user_id))
+        """, (now - 86400, user_id, user_id))
         tasks = cursor.fetchall()
 
     if not tasks:
         bot.send_message(user_id, "✅ У вас нет активных невыполненных заданий.")
         return
 
-    # Отфильтровываем чаты, где пользователь не состоит
+    # Фильтруем: только те чаты, где пользователь является участником (не админ, не вышел)
     filtered = []
     for task in tasks:
         chat_id = task[0]
         try:
-            bot.get_chat_member(chat_id, user_id)
+            member = bot.get_chat_member(chat_id, user_id)
+            # Пропускаем вышедших, удалённых и администраторов
+            if member.status in ["left", "kicked"]:
+                continue
+            if member.status in ["administrator", "creator"]:
+                continue
             filtered.append(task)
-        except:
+        except Exception:
+            # Если не удалось получить информацию (пользователь не в чате), пропускаем
             continue
 
     if not filtered:
@@ -164,7 +169,6 @@ def my_tasks(message):
             chats[chat_id] = {'title': chat_title, 'tasks': []}
         chats[chat_id]['tasks'].append((task_id, link, activity, author_name, msg_id))
 
-    # Формируем ответ (только ссылки)
     response = "📋 *Ваши активные задания:*\n\n"
     for chat_id, data in chats.items():
         response += f"*{data['title']}*:\n"
@@ -229,7 +233,6 @@ def done(call):
 # ---------- Основной обработчик сообщений ----------
 @bot.message_handler(func=lambda m: True)
 def handle_message(message):
-    # Игнорируем личные сообщения (команда уже обработана)
     if message.chat.type == "private":
         return
 
@@ -250,7 +253,6 @@ def handle_message(message):
         )
         conn.commit()
 
-    # Выходные – удаляем сообщения не-админов
     if not is_work_time(message.date):
         if not is_user_admin:
             try:
@@ -259,7 +261,6 @@ def handle_message(message):
                 pass
         return
 
-    # Поиск ссылки
     match = re.search(link_pattern, message.text)
     if not match:
         if not is_user_admin:
@@ -272,7 +273,7 @@ def handle_message(message):
     link = match.group()
     activity = message.text.replace(link, "").strip() or "лайк"
 
-    # ---- Суточный лимит: 1 задание (не для админов) ----
+    # Суточный лимит: 1 задание (не для админов)
     if not is_user_admin:
         with db_lock:
             cursor.execute(
@@ -286,11 +287,7 @@ def handle_message(message):
                 except:
                     pass
                 return
-    else:
-        # Для администраторов лимит не проверяем
-        print(f"Admin {user_id} – no limit applied")
 
-    # Создаём задание
     with db_lock:
         cursor.execute(
             "INSERT INTO tasks (chat_id, author, author_name, link, activity, created) "
@@ -310,14 +307,13 @@ def handle_message(message):
         cursor.execute("UPDATE tasks SET message_id=? WHERE id=?", (sent.message_id, task_id))
         conn.commit()
 
-    # Удаляем исходное сообщение, если автор не админ
     if not is_user_admin:
         try:
             bot.delete_message(chat_id, message.message_id)
         except:
             pass
 
-# ---------- Планировщик (отчёты, сбросы) ----------
+# ---------- Планировщик ----------
 def scheduler():
     weekly_reported = set()
     friday_notified = set()
@@ -337,23 +333,20 @@ def scheduler():
             chats |= {r[0] for r in cursor.fetchall()}
 
         for chat_id in chats:
-            # Пятница 23:00
             if day == 4 and hour == 23 and (chat_id, week_num) not in friday_notified:
                 try:
-                    bot.send_message(chat_id, "🌙 Пост-чат ушел на выходные! Актив по желанию")
+                    bot.send_message(chat_id, "🌙 Пост-чат ушел на выходные! Всем отличного отдыха!")
                 except:
                     pass
                 friday_notified.add((chat_id, week_num))
 
-            # Понедельник 7:00
             if day == 0 and hour == 7 and (chat_id, week_num) not in monday_notified:
                 try:
-                    bot.send_message(chat_id, "☀️ Доброе утро, пост-чат работает в нормальном режиме")
+                    bot.send_message(chat_id, "☀️ Доброе утро, пост-чат работает в нормальном режиме! Всем хорошей недели!")
                 except:
                     pass
                 monday_notified.add((chat_id, week_num))
 
-            # Истекшие задания (24 часа)
             with db_lock:
                 cursor.execute(
                     "SELECT id, created, author, author_name, message_id, link FROM tasks WHERE chat_id=?",
@@ -406,7 +399,6 @@ def scheduler():
                         cursor.execute("DELETE FROM tasks WHERE id=?", (task_id,))
                         conn.commit()
 
-            # Недельный отчёт (воскресенье 12:00)
             if day == 6 and hour == 12 and (chat_id, week_num) not in weekly_reported:
                 week_ago = now - 604800
                 with db_lock:
