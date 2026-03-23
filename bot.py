@@ -25,6 +25,8 @@ def reset_webhook(token):
 reset_webhook(TOKEN)
 time.sleep(2)
 
+bot = telebot.TeleBot(TOKEN)
+
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
     if message.chat.type == "private":
@@ -37,8 +39,7 @@ def send_welcome(message):
             "• Чтобы узнать свои невыполненные задания, напиши /my_tasks в личку.\n\n"
             "Если есть вопросы – пиши администратору."
         )
-bot = telebot.TeleBot(TOKEN)
-
+        
 conn = sqlite3.connect("db.db", check_same_thread=False)
 cursor = conn.cursor()
 db_lock = threading.Lock()
